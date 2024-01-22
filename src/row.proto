@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package atpquery;
+
+message Row {
+  string repo = 1;
+  string collection = 2;
+  string rkey = 3;
+  string record = 4;
+}
