@@ -1,7 +1,5 @@
 mod firehose;
 
-use std::io::Write;
-
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
@@ -38,19 +36,26 @@ mod proto {
 
 const CHECKPOINT_FILE_NAME: &str = "atpquery.checkpoint";
 
-fn write_checkpoint(checkpoint: &proto::Checkpoint) -> Result<(), anyhow::Error> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Checkpoint {
+    write_stream: String,
+    bq_seq: i64,
+    firehose_seq: i64,
+}
+
+fn write_checkpoint(checkpoint: &Checkpoint) -> Result<(), anyhow::Error> {
     let mut f = std::fs::File::options()
         .create(true)
         .write(true)
         .truncate(true)
         .open(format!("{CHECKPOINT_FILE_NAME}.tmp"))?;
-    f.write_all(&checkpoint.encode_to_vec()[..])?;
+    serde_json::to_writer(&mut f, checkpoint)?;
     std::fs::rename(format!("{CHECKPOINT_FILE_NAME}.tmp"), CHECKPOINT_FILE_NAME)?;
     Ok(())
 }
 
-fn read_checkpoint() -> Result<Option<proto::Checkpoint>, anyhow::Error> {
-    let d = match std::fs::read(CHECKPOINT_FILE_NAME) {
+fn read_checkpoint() -> Result<Option<Checkpoint>, anyhow::Error> {
+    let mut f = match std::fs::File::open(CHECKPOINT_FILE_NAME) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
@@ -59,7 +64,7 @@ fn read_checkpoint() -> Result<Option<proto::Checkpoint>, anyhow::Error> {
             return Err(e.into());
         }
     };
-    Ok(Some(proto::Checkpoint::decode(&d[..])?))
+    Ok(serde_json::from_reader(&mut f)?)
 }
 
 #[tokio::main]
@@ -87,12 +92,14 @@ async fn main() -> Result<(), anyhow::Error> {
         "{}/xrpc/com.atproto.sync.subscribeRepos",
         args.firehose_host
     );
-    if let Some(cursor) = checkpoint.as_ref().map(|c| c.seq) {
+    if let Some(cursor) = checkpoint.as_ref().map(|c| c.firehose_seq) {
         tracing::info!(cursor = cursor);
         url.push_str(&format!("?cursor={cursor}"));
     } else {
         tracing::info!("no cursor");
     }
+
+    let mut bq_seq = checkpoint.as_ref().map(|c| c.bq_seq).unwrap_or(0);
 
     let bigquery_write_client = gcloud_sdk::GoogleApi::from_function(
         gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient::new,
@@ -148,9 +155,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let (mut tx, mut rx) = stream.split();
 
     let (mut bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
+    let seqs = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
     let mut task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::task::spawn({
         let write_stream = write_stream.clone();
+        let seqs = std::sync::Arc::clone(&seqs);
 
         async move {
             use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_response::Response;
@@ -170,8 +179,15 @@ async fn main() -> Result<(), anyhow::Error> {
                         return Err(tonic::Status::new(status.code.into(), status.message).into());
                     }
                 };
-                write_checkpoint(&proto::Checkpoint {
-                    seq: r.offset.unwrap(),
+                let bq_seq = r.offset.unwrap();
+                let firehose_seq = {
+                    let mut seqs = seqs.lock().await;
+                    *seqs = seqs.split_off(&bq_seq);
+                    seqs.remove(&bq_seq).unwrap()
+                };
+                write_checkpoint(&Checkpoint {
+                    bq_seq,
+                    firehose_seq,
                     write_stream: write_stream.clone(),
                 })?;
             }
@@ -205,7 +221,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 };
 
-                process_message(&msg, &write_stream, &mut bqw_tx)
+                process_message(&msg, &write_stream, &mut bqw_tx, &mut bq_seq, &seqs)
                     .instrument(tracing::info_span!("process_message"))
                     .await?;
             }
@@ -249,6 +265,8 @@ async fn process_message(
     req_tx: &mut tokio::sync::mpsc::Sender<
         gcloud_sdk::google::cloud::bigquery::storage::v1::AppendRowsRequest,
     >,
+    bq_seq: &mut i64,
+    seqs: &std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeMap<i64, i64>>>,
 ) -> Result<(), anyhow::Error> {
     let (_seq, time) = match firehose::Message::parse(message)? {
         firehose::Message::Info(info) => {
@@ -265,6 +283,8 @@ async fn process_message(
                     return Ok(());
                 }
             };
+
+            let mut rows = vec![];
 
             for op in commit.ops {
                 let (collection, rkey) = match op.path.splitn(2, '/').collect::<Vec<_>>()[..] {
@@ -290,34 +310,12 @@ async fn process_message(
                             >(
                                 &mut std::io::Cursor::new(item),
                             )?)?)?;
-                        {
-                            use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{Rows, ProtoData};
-                            use gcloud_sdk::google::cloud::bigquery::storage::v1::{AppendRowsRequest, ProtoRows, ProtoSchema};
-                            let row = proto::Row {
-                                collection: collection.to_string(),
-                                repo: commit.repo.clone(),
-                                rkey: rkey.to_string(),
-                                record: Some(record.clone()),
-                            };
-                            req_tx
-                                .send(AppendRowsRequest {
-                                    write_stream: write_stream.to_string(),
-                                    offset: Some(commit.seq),
-                                    rows: Some(Rows::ProtoRows(ProtoData {
-                                        writer_schema: Some(ProtoSchema {
-                                            proto_descriptor: Some(
-                                                row.descriptor().descriptor_proto().clone(),
-                                            ),
-                                        }),
-                                        rows: Some(ProtoRows {
-                                            serialized_rows: vec![row.encode_to_vec()],
-                                        }),
-                                        ..Default::default()
-                                    })),
-                                    ..Default::default()
-                                })
-                                .await?;
-                        }
+                        rows.push(proto::Row {
+                            collection: Some(collection.to_string()),
+                            repo: Some(commit.repo.clone()),
+                            rkey: Some(rkey.to_string()),
+                            record: Some(record.clone()),
+                        });
                         tracing::info!(
                             action = op.action,
                             seq = commit.seq,
@@ -328,33 +326,12 @@ async fn process_message(
                         );
                     }
                     "delete" => {
-                        use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{Rows, ProtoData};
-                        use gcloud_sdk::google::cloud::bigquery::storage::v1::{AppendRowsRequest, ProtoRows, ProtoSchema};
-                        let row = proto::Row {
-                            collection: collection.to_string(),
-                            repo: commit.repo.clone(),
-                            rkey: rkey.to_string(),
+                        rows.push(proto::Row {
+                            collection: Some(collection.to_string()),
+                            repo: Some(commit.repo.clone()),
+                            rkey: Some(rkey.to_string()),
                             record: None,
-                        };
-                        req_tx
-                            .send(AppendRowsRequest {
-                                write_stream: write_stream.to_string(),
-                                offset: Some(commit.seq),
-                                rows: Some(Rows::ProtoRows(ProtoData {
-                                    writer_schema: Some(ProtoSchema {
-                                        proto_descriptor: Some(
-                                            row.descriptor().descriptor_proto().clone(),
-                                        ),
-                                    }),
-                                    rows: Some(ProtoRows {
-                                        serialized_rows: vec![row.encode_to_vec()],
-                                    }),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            })
-                            .await?;
-
+                        });
                         tracing::info!(
                             action = op.action,
                             seq = commit.seq,
@@ -368,6 +345,47 @@ async fn process_message(
                     }
                 }
             }
+
+            if let Some(first_row) = rows.first() {
+                let offset = *bq_seq;
+                {
+                    let mut seqs = seqs.lock().await;
+                    seqs.insert(offset, commit.seq);
+                }
+                *bq_seq += 1;
+
+                {
+                    use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
+                        ProtoData, Rows,
+                    };
+                    use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+                        AppendRowsRequest, ProtoRows, ProtoSchema,
+                    };
+
+                    req_tx
+                        .send(AppendRowsRequest {
+                            write_stream: write_stream.to_string(),
+                            offset: Some(offset),
+                            rows: Some(Rows::ProtoRows(ProtoData {
+                                writer_schema: Some(ProtoSchema {
+                                    proto_descriptor: Some(
+                                        first_row.descriptor().descriptor_proto().clone(),
+                                    ),
+                                }),
+                                rows: Some(ProtoRows {
+                                    serialized_rows: rows
+                                        .into_iter()
+                                        .map(|v| v.encode_to_vec())
+                                        .collect(),
+                                }),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        })
+                        .await?;
+                }
+            }
+
             (commit.seq, commit.time)
         }
         firehose::Message::Tombstone(tombstone) => {
