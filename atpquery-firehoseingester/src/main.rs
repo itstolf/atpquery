@@ -22,7 +22,7 @@ struct Args {
     prometheus_listen: std::net::SocketAddr,
 }
 
-const CHECKPOINT_FILE_NAME: &str = "atpquery.checkpoint";
+const CHECKPOINT_FILE_NAME: &str = "atpquery-firehoseingester.checkpoint";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Checkpoint {
