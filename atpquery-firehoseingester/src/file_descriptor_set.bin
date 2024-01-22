@@ -1,10 +1,12 @@
 
-|
-	row.protoatpquery"e
+œ
+	row.protoatpquery"„
 Row
 repo (	Rrepo
 
 collection (	R
 collection
-rkey (	Rrkey
-record (	Rrecord
+rkey (	Rrkey
+
+ingest_seq (R	ingestSeq
+record (	Rrecord

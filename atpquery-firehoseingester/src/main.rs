@@ -285,6 +285,7 @@ async fn process_message(
             };
 
             let mut rows = vec![];
+            let offset = *bq_seq;
 
             for op in commit.ops {
                 let (collection, rkey) = match op.path.splitn(2, '/').collect::<Vec<_>>()[..] {
@@ -295,7 +296,7 @@ async fn process_message(
                 };
 
                 match op.action.as_str() {
-                    "create" => {
+                    "create" | "update" => {
                         let item = if let Some(item) = op.cid.and_then(|cid| items.get(&cid.into()))
                         {
                             item
@@ -314,6 +315,7 @@ async fn process_message(
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),
+                            ingest_seq: Some(offset),
                             record: Some(record.clone()),
                         });
                         tracing::info!(
@@ -330,6 +332,7 @@ async fn process_message(
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),
+                            ingest_seq: Some(offset),
                             record: None,
                         });
                         tracing::info!(
@@ -347,12 +350,11 @@ async fn process_message(
             }
 
             if let Some(first_row) = rows.first() {
-                let offset = *bq_seq;
                 {
                     let mut seqs = seqs.lock().await;
                     seqs.insert(offset, commit.seq);
+                    *bq_seq += 1;
                 }
-                *bq_seq += 1;
 
                 {
                     use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
