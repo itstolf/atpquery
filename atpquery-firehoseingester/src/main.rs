@@ -173,7 +173,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 let r = match v.response.unwrap() {
                     Response::AppendResult(r) => r,
                     Response::Error(status) => {
-                        if status.code == tonic::Code::AlreadyExists as i32 {
+                        if status.code == tonic::Code::AlreadyExists as i32
+                            || status.code == tonic::Code::Aborted as i32
+                        {
                             continue;
                         }
                         return Err(tonic::Status::new(status.code.into(), status.message).into());
