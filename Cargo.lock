@@ -170,6 +170,7 @@ name = "atpquery-firehoseingester"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atpquery-protos",
  "ciborium",
  "cid",
  "clap",
@@ -177,12 +178,9 @@ dependencies = [
  "gcloud-sdk",
  "metrics",
  "metrics-exporter-prometheus",
- "once_cell",
  "openssl",
  "prost",
- "prost-build",
  "prost-reflect",
- "prost-reflect-build",
  "rs-car",
  "serde",
  "serde_bytes",
@@ -195,6 +193,17 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "atpquery-protos"
+version = "0.0.0"
+dependencies = [
+ "once_cell",
+ "prost",
+ "prost-build",
+ "prost-reflect",
+ "prost-reflect-build",
 ]
 
 [[package]]

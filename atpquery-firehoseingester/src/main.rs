@@ -22,18 +22,6 @@ struct Args {
     prometheus_listen: std::net::SocketAddr,
 }
 
-mod proto {
-    static DESCRIPTOR_POOL: once_cell::sync::Lazy<prost_reflect::DescriptorPool> =
-        once_cell::sync::Lazy::new(|| {
-            prost_reflect::DescriptorPool::decode(
-                include_bytes!("file_descriptor_set.bin").as_ref(),
-            )
-            .unwrap()
-        });
-
-    include!(concat!(env!("OUT_DIR"), "/atpquery.rs"));
-}
-
 const CHECKPOINT_FILE_NAME: &str = "atpquery.checkpoint";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -50,6 +38,7 @@ fn write_checkpoint(checkpoint: &Checkpoint) -> Result<(), anyhow::Error> {
         .truncate(true)
         .open(format!("{CHECKPOINT_FILE_NAME}.tmp"))?;
     serde_json::to_writer(&mut f, checkpoint)?;
+    f.sync_data()?;
     std::fs::rename(format!("{CHECKPOINT_FILE_NAME}.tmp"), CHECKPOINT_FILE_NAME)?;
     Ok(())
 }
@@ -313,7 +302,7 @@ async fn process_message(
                             >(
                                 &mut std::io::Cursor::new(item),
                             )?)?)?;
-                        rows.push(proto::Row {
+                        rows.push(atpquery_protos::Row {
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),
@@ -330,7 +319,7 @@ async fn process_message(
                         );
                     }
                     "delete" => {
-                        rows.push(proto::Row {
+                        rows.push(atpquery_protos::Row {
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),

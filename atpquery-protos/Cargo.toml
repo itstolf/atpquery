@@ -1,0 +1,13 @@
+[package]
+name = "atpquery-protos"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1"
+prost = "0.12"
+prost-reflect = "0.12"
+
+[build-dependencies]
+prost-build = "0.12"
+prost-reflect-build = "0.12"
