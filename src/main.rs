@@ -17,9 +17,6 @@ struct Args {
     #[arg(long, default_value = "atpquery")]
     bigquery_dataset: String,
 
-    #[arg(long, default_value = "records")]
-    bigquery_table: String,
-
     #[arg(long, default_value = "wss://bsky.network")]
     firehose_host: String,
 
@@ -129,13 +126,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let write_stream = if let Some(write_stream) = write_stream {
         write_stream
     } else {
+        const TABLE_NAME: &str = "raw_records";
         bigquery_write_client.get().create_write_stream(
             gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
                 parent: format!(
-                    "projects/{project}/datasets/{dataset}/tables/{table}",
+                    "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
                     project = args.bigquery_project,
                     dataset = args.bigquery_dataset,
-                    table = args.bigquery_table,
                 ),
                 write_stream: Some(
                     gcloud_sdk::google::cloud::bigquery::storage::v1::WriteStream {
@@ -152,11 +149,34 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let (mut bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
 
-    let mut task = tokio::task::spawn(async move {
-        bigquery_write_client
-            .get()
-            .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
-            .await
+    let mut task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::task::spawn({
+        let write_stream = write_stream.clone();
+
+        async move {
+            use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_response::Response;
+            let mut stream = bigquery_write_client
+                .get()
+                .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
+                .await?
+                .into_inner();
+
+            while let Some(v) = stream.message().await? {
+                let r = match v.response.unwrap() {
+                    Response::AppendResult(r) => r,
+                    Response::Error(status) => {
+                        if status.code == tonic::Code::AlreadyExists as i32 {
+                            continue;
+                        }
+                        return Err(tonic::Status::new(status.code.into(), status.message).into());
+                    }
+                };
+                write_checkpoint(&proto::Checkpoint {
+                    seq: r.offset.unwrap(),
+                    write_stream: write_stream.clone(),
+                })?;
+            }
+            Ok(())
+        }
     });
 
     loop {
@@ -169,8 +189,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             r = &mut task => {
-                let _ = r?;
-                return Ok(())
+                return r?.map_err(|e| e.into());
             }
 
             msg = tokio::time::timeout(std::time::Duration::from_secs(60), rx.next()) => {
@@ -205,7 +224,7 @@ fn rewrite_tags(v: ciborium::Value) -> Result<ciborium::Value, cid::Error> {
         | ciborium::Value::Bool(_)
         | ciborium::Value::Null => v,
         ciborium::Value::Tag(42, v) => match v.as_ref() {
-            ciborium::Value::Bytes(v) if v.first().copied() == Some(0x00) => {
+            ciborium::Value::Bytes(v) if v.first() == Some(&0x00) => {
                 ciborium::Value::Text(cid::Cid::read_bytes(&v[1..])?.to_string())
             }
             _ => ciborium::Value::Tag(42, v),
@@ -231,7 +250,7 @@ async fn process_message(
         gcloud_sdk::google::cloud::bigquery::storage::v1::AppendRowsRequest,
     >,
 ) -> Result<(), anyhow::Error> {
-    let (seq, time) = match firehose::Message::parse(message)? {
+    let (_seq, time) = match firehose::Message::parse(message)? {
         firehose::Message::Info(info) => {
             tracing::info!(name = info.name, message = info.message);
             return Ok(());
@@ -278,7 +297,7 @@ async fn process_message(
                                 collection: collection.to_string(),
                                 repo: commit.repo.clone(),
                                 rkey: rkey.to_string(),
-                                record: record.clone(),
+                                record: Some(record.clone()),
                             };
                             req_tx
                                 .send(AppendRowsRequest {
@@ -309,6 +328,33 @@ async fn process_message(
                         );
                     }
                     "delete" => {
+                        use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{Rows, ProtoData};
+                        use gcloud_sdk::google::cloud::bigquery::storage::v1::{AppendRowsRequest, ProtoRows, ProtoSchema};
+                        let row = proto::Row {
+                            collection: collection.to_string(),
+                            repo: commit.repo.clone(),
+                            rkey: rkey.to_string(),
+                            record: None,
+                        };
+                        req_tx
+                            .send(AppendRowsRequest {
+                                write_stream: write_stream.to_string(),
+                                offset: Some(commit.seq),
+                                rows: Some(Rows::ProtoRows(ProtoData {
+                                    writer_schema: Some(ProtoSchema {
+                                        proto_descriptor: Some(
+                                            row.descriptor().descriptor_proto().clone(),
+                                        ),
+                                    }),
+                                    rows: Some(ProtoRows {
+                                        serialized_rows: vec![row.encode_to_vec()],
+                                    }),
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            })
+                            .await?;
+
                         tracing::info!(
                             action = op.action,
                             seq = commit.seq,
@@ -331,11 +377,6 @@ async fn process_message(
         firehose::Message::Handle(handle) => (handle.seq, handle.time),
         firehose::Message::Migrate(migrate) => (migrate.seq, migrate.time),
     };
-
-    write_checkpoint(&proto::Checkpoint {
-        write_stream: write_stream.to_string(),
-        seq,
-    })?;
 
     let now = time::OffsetDateTime::now_utc();
     metrics::histogram!(

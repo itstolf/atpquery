@@ -13,6 +13,7 @@ gcloud-sdk = { version = "0.24", features = ["google-cloud-bigquery-storage-v1"]
 metrics = "0.21"
 metrics-exporter-prometheus = { version = "0.12", features = ["http-listener"] }
 once_cell = "1"
+openssl = { version = "0.10", features = ["vendored"] }
 prost = { version = "0.12", features = ["prost-derive"] }
 prost-reflect = { version = "0.12", features = ["derive"] }
 rs-car = "0.4"
