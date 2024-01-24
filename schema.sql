@@ -6,4 +6,4 @@ CREATE TABLE atpquery.raw_records (
     record JSON
 );
 
-ALTER TABLE atpquery.raw_records ADD PRIMARY KEY (repo, collection, rkey) NOT ENFORCED;
+ALTER TABLE atpquery.raw_records ADD PRIMARY KEY (repo, collection, rkey, rev) NOT ENFORCED;

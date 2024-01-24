@@ -275,7 +275,7 @@ async fn process_message(
                 }
             };
 
-            let rev = commit.rev.to_u64() as i64;
+            let rev = commit.rev.0 as i64;
 
             let mut rows = vec![];
             let offset = *bq_seq;
