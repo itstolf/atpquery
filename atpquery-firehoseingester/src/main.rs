@@ -88,8 +88,6 @@ async fn main() -> Result<(), anyhow::Error> {
         tracing::info!("no cursor");
     }
 
-    let mut bq_seq = checkpoint.as_ref().map(|c| c.bq_seq).unwrap_or(0);
-
     let bigquery_write_client = gcloud_sdk::GoogleApi::from_function(
         gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient::new,
         "https://bigquerystorage.googleapis.com",
@@ -97,33 +95,36 @@ async fn main() -> Result<(), anyhow::Error> {
     )
         .await?;
 
-    let write_stream =
-        if let Some(write_stream) = checkpoint.as_ref().map(|c| c.write_stream.to_string()) {
-            match bigquery_write_client
-                .get()
-                .get_write_stream(
-                    gcloud_sdk::google::cloud::bigquery::storage::v1::GetWriteStreamRequest {
-                        name: write_stream.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) => Some(write_stream),
-                Err(e) if e.code() == tonic::Code::NotFound => None,
-                Err(e) => {
-                    return Err(e.into());
-                }
+    let write_stream_and_bq_seq = if let Some((write_stream, bq_seq)) = checkpoint
+        .as_ref()
+        .map(|c| (c.write_stream.to_string(), c.bq_seq))
+    {
+        match bigquery_write_client
+            .get()
+            .get_write_stream(
+                gcloud_sdk::google::cloud::bigquery::storage::v1::GetWriteStreamRequest {
+                    name: write_stream.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Some((write_stream, bq_seq)),
+            Err(e) if e.code() == tonic::Code::NotFound => None,
+            Err(e) => {
+                return Err(e.into());
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
-    let write_stream = if let Some(write_stream) = write_stream {
-        write_stream
+    let (write_stream, mut bq_seq) = if let Some(write_stream_and_bq_seq) = write_stream_and_bq_seq
+    {
+        write_stream_and_bq_seq
     } else {
         const TABLE_NAME: &str = "raw_records";
-        bigquery_write_client.get().create_write_stream(
+        (bigquery_write_client.get().create_write_stream(
             gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
                 parent: format!(
                     "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
@@ -137,7 +138,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     },
                 ),
             },
-        ).await?.get_ref().name.clone()
+        ).await?.get_ref().name.clone(), 0)
     };
 
     let (stream, _) = tokio_tungstenite::connect_async(url).await?;
@@ -386,7 +387,47 @@ async fn process_message(
             (commit.seq, commit.time)
         }
         firehose::Message::Tombstone(tombstone) => {
-            // Delete tombstone.did from Bigquery.
+            let offset = *bq_seq;
+            {
+                let mut seqs = seqs.lock().await;
+                seqs.insert(offset, tombstone.seq);
+                *bq_seq += 1;
+            }
+
+            {
+                use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
+                    ProtoData, Rows,
+                };
+                use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+                    AppendRowsRequest, ProtoRows, ProtoSchema,
+                };
+
+                let row = atpquery_protos::Row {
+                    collection: Some(tombstone.did),
+                    repo: None,
+                    rkey: None,
+                    rev: None,
+                    record: None,
+                };
+
+                req_tx
+                    .send(AppendRowsRequest {
+                        write_stream: write_stream.to_string(),
+                        offset: Some(offset),
+                        rows: Some(Rows::ProtoRows(ProtoData {
+                            writer_schema: Some(ProtoSchema {
+                                proto_descriptor: Some(row.descriptor().descriptor_proto().clone()),
+                            }),
+                            rows: Some(ProtoRows {
+                                serialized_rows: vec![row.encode_to_vec()],
+                            }),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+
             (tombstone.seq, tombstone.time)
         }
         firehose::Message::Handle(handle) => (handle.seq, handle.time),
