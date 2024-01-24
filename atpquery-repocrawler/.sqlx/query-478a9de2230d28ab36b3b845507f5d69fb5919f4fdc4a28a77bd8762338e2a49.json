@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                            INSERT INTO committing (write_stream) VALUES (?)\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "478a9de2230d28ab36b3b845507f5d69fb5919f4fdc4a28a77bd8762338e2a49"
+}

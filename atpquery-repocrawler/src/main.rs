@@ -55,12 +55,20 @@ fn rewrite_tags(v: ciborium::Value) -> Result<ciborium::Value, cid::Error> {
     })
 }
 
+use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{ProtoData, Rows};
+use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient;
+use gcloud_sdk::google::cloud::bigquery::storage::v1::{AppendRowsRequest, ProtoRows, ProtoSchema};
+
+const TABLE_NAME: &str = "raw_records";
+
 async fn worker_main(
     relay_host: String,
     bigquery_project: String,
     bigquery_dataset: String,
     client: reqwest::Client,
-    bigquery_write_client: gcloud_sdk::GoogleApi<gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient<gcloud_sdk::GoogleAuthMiddleware>>,
+    bigquery_write_client: gcloud_sdk::GoogleApi<
+        BigQueryWriteClient<gcloud_sdk::GoogleAuthMiddleware>,
+    >,
     rl: std::sync::Arc<governor::DefaultDirectRateLimiter>,
     rx: async_channel::Receiver<String>,
     db_conn: std::sync::Arc<tokio::sync::Mutex<sqlx::sqlite::SqliteConnection>>,
@@ -70,22 +78,26 @@ async fn worker_main(
 
         for attempt in 0..5 {
             if let Err(err) = {
-                const TABLE_NAME: &str = "raw_records";
-                let write_stream = bigquery_write_client.get().create_write_stream(
-                    gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
+                use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+                    write_stream, CreateWriteStreamRequest, WriteStream,
+                };
+                let write_stream = bigquery_write_client
+                    .get()
+                    .create_write_stream(CreateWriteStreamRequest {
                         parent: format!(
                             "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
                             project = bigquery_project,
                             dataset = bigquery_dataset,
                         ),
-                        write_stream: Some(
-                            gcloud_sdk::google::cloud::bigquery::storage::v1::WriteStream {
-                                r#type: gcloud_sdk::google::cloud::bigquery::storage::v1::write_stream::Type::Pending as i32,
-                                ..Default::default()
-                            },
-                        ),
-                    },
-                ).await?.get_ref().name.clone();
+                        write_stream: Some(WriteStream {
+                            r#type: write_stream::Type::Pending as i32,
+                            ..Default::default()
+                        }),
+                    })
+                    .await?
+                    .get_ref()
+                    .name
+                    .clone();
 
                 let mut blockstore_loader = atproto_repo::blockstore::Loader::new();
                 blockstore_loader.mst_ignore_missing(true);
@@ -95,6 +107,7 @@ async fn worker_main(
                 let client = &client;
                 let did = did.as_str();
                 let write_stream = &write_stream;
+                let db_conn = std::sync::Arc::clone(&db_conn);
                 let bigquery_project = bigquery_project.as_str();
                 let bigquery_dataset = bigquery_dataset.as_str();
                 let bigquery_write_client = bigquery_write_client.clone();
@@ -124,115 +137,166 @@ async fn worker_main(
 
                     let (bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
 
-                    let mut bqw_stream = bigquery_write_client
-                        .get()
-                        .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
-                        .await?
-                        .into_inner();
+                    {
+                        let mut bqw_stream = bigquery_write_client
+                            .get()
+                            .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
+                            .await?
+                            .into_inner();
 
-                    for (key, cid) in repo.key_and_cids() {
-                        let key = String::from_utf8_lossy(key);
-                        let (collection, rkey) = match key.splitn(2, '/').collect::<Vec<_>>()[..] {
-                            [collection, rkey] => (collection, rkey),
-                            _ => {
+                        let mut n = 0;
+                        for (key, cid) in repo.key_and_cids() {
+                            let key = String::from_utf8_lossy(key);
+                            let parts = key.splitn(2, '/').collect::<Vec<_>>();
+                            let (collection, rkey) = match parts[..] {
+                                [collection, rkey] => (collection, rkey),
+                                _ => {
+                                    continue;
+                                }
+                            };
+
+                            let block = if let Some(block) = repo.get_by_cid(cid) {
+                                block
+                            } else {
                                 continue;
-                            }
-                        };
+                            };
 
-                        let block = if let Some(block) = repo.get_by_cid(cid) {
-                            block
-                        } else {
-                            continue;
-                        };
+                            let row = atpquery_protos::Row {
+                                repo: Some(did.to_string()),
+                                collection: Some(collection.to_string()),
+                                rkey: Some(rkey.to_string()),
+                                rev: Some(repo.commit().rev.0 as i64),
+                                record: Some(serde_json::to_string(&rewrite_tags(
+                                    ciborium::from_reader::<ciborium::Value, _>(
+                                        &mut std::io::Cursor::new(block),
+                                    )?,
+                                )?)?),
+                            };
 
-                        use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
-                            ProtoData, Rows,
-                        };
-                        use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-                            AppendRowsRequest, ProtoRows, ProtoSchema,
-                        };
-
-                        let row = atpquery_protos::Row {
-                            repo: Some(did.to_string()),
-                            collection: Some(collection.to_string()),
-                            rkey: Some(rkey.to_string()),
-                            rev: Some(repo.commit().rev.0 as i64),
-                            record: Some(serde_json::to_string(&rewrite_tags(
-                                ciborium::from_reader::<ciborium::Value, _>(
-                                    &mut std::io::Cursor::new(block),
-                                )?,
-                            )?)?),
-                        };
-
-                        bqw_tx
-                            .send(AppendRowsRequest {
-                                write_stream: write_stream.to_string(),
-                                rows: Some(Rows::ProtoRows(ProtoData {
-                                    writer_schema: Some(ProtoSchema {
-                                        proto_descriptor: Some(
-                                            row.descriptor().descriptor_proto().clone(),
-                                        ),
-                                    }),
-                                    rows: Some(ProtoRows {
-                                        serialized_rows: vec![row.encode_to_vec()],
-                                    }),
+                            bqw_tx
+                                .send(AppendRowsRequest {
+                                    write_stream: write_stream.to_string(),
+                                    rows: Some(Rows::ProtoRows(ProtoData {
+                                        writer_schema: Some(ProtoSchema {
+                                            proto_descriptor: Some(
+                                                row.descriptor().descriptor_proto().clone(),
+                                            ),
+                                        }),
+                                        rows: Some(ProtoRows {
+                                            serialized_rows: vec![row.encode_to_vec()],
+                                        }),
+                                        ..Default::default()
+                                    })),
                                     ..Default::default()
-                                })),
-                                ..Default::default()
-                            })
-                            .await?;
+                                })
+                                .await?;
+
+                            n += 1;
+
+                            const BATCH_SIZE: usize = 100;
+                            if n % BATCH_SIZE == 0 {
+                                while n > 0 {
+                                    bqw_stream.message().await?;
+                                    n -= 1;
+                                }
+                            }
+                        }
+
+                        while n > 0 {
+                            bqw_stream.message().await?;
+                            n -= 1;
+                        }
                     }
 
-                    // TODO: Check stream completion.
-                    bigquery_write_client
-                    .get()
-                    .finalize_write_stream(
-                        gcloud_sdk::google::cloud::bigquery::storage::v1::FinalizeWriteStreamRequest {
-                            name: write_stream.clone(),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-
-                    // TODO: Save write stream name.
+                    use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+                        BatchCommitWriteStreamsRequest, FinalizeWriteStreamRequest,
+                    };
                     bigquery_write_client
                         .get()
-                        .batch_commit_write_streams(
-                            gcloud_sdk::google::cloud::bigquery::storage::v1::BatchCommitWriteStreamsRequest {
-                                parent: format!(
-                                    "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
-                                    project = bigquery_project,
-                                    dataset = bigquery_dataset,
-                                ),
-                                write_streams: vec![write_stream.clone()],
-                                ..Default::default()
-                            },
-                        )
+                        .finalize_write_stream(FinalizeWriteStreamRequest {
+                            name: write_stream.clone(),
+                            ..Default::default()
+                        })
                         .await?;
 
+                    {
+                        let mut db_conn = db_conn.lock().await;
+                        let mut tx = db_conn.begin().await?;
+
+                        sqlx::query!(
+                            r#"--sql
+                            DELETE FROM pending WHERE did = ?
+                            "#,
+                            did
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+
+                        sqlx::query!(
+                            r#"--sql
+                            INSERT INTO committing (write_stream) VALUES (?)
+                            "#,
+                            write_stream
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+
+                        tx.commit().await?;
+                    }
+
+                    bigquery_write_client
+                        .get()
+                        .batch_commit_write_streams(BatchCommitWriteStreamsRequest {
+                            parent: format!(
+                                "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
+                                project = bigquery_project,
+                                dataset = bigquery_dataset,
+                            ),
+                            write_streams: vec![write_stream.clone()],
+                            ..Default::default()
+                        })
+                        .await?;
+
+                    {
+                        let mut db_conn = db_conn.lock().await;
+
+                        sqlx::query!(
+                            r#"--sql
+                            DELETE FROM committing WHERE write_stream = ?
+                            "#,
+                            write_stream
+                        )
+                        .execute(&mut *db_conn)
+                        .await?;
+                    }
+
+                    tracing::info!(action = "repo", did = did);
                     Ok::<_, anyhow::Error>(())
                 })()
                 .await
             } {
                 let why = format!("{:?}", err);
                 tracing::error!(did, why, attempt);
-                match err.downcast_ref::<atproto_repo::blockstore::Error>() {
-                    Some(atproto_repo::blockstore::Error::MissingRootCid(_)) => {
-                        // Try again.
-                        continue;
-                    }
-                    _ => {}
+
+                if matches!(
+                    err.downcast_ref::<atproto_repo::blockstore::Error>(),
+                    Some(atproto_repo::blockstore::Error::MissingRootCid(_))
+                ) {
+                    // Try again.
+                    continue;
                 }
-                // sqlx::query!(
-                //     r#"--sql
-                //     INSERT INTO errors (did, why)
-                //     VALUES ($1, $2)
-                //     "#,
-                //     did,
-                //     why
-                // )
-                // .execute(&mut *tx)
-                // .await?;
+
+                let mut db_conn = db_conn.lock().await;
+                sqlx::query!(
+                    r#"--sql
+                    INSERT INTO errors (did, why)
+                    VALUES ($1, $2)
+                    "#,
+                    did,
+                    why
+                )
+                .execute(&mut *db_conn)
+                .await?;
             }
             break;
         }
@@ -266,8 +330,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 cursor TEXT NOT NULL PRIMARY KEY
             );
 
-            CREATE TABLE IF NOT EXISTS finalizing (
-                did TEXT NOT NULL PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS committing (
+                write_stream TEXT NOT NULL PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS errors (
+                did TEXT NOT NULL,
+                why TEXT NOT NULL
             );
             "#,
             )
@@ -318,6 +387,39 @@ async fn main() -> Result<(), anyhow::Error> {
         })
         .collect::<Vec<_>>();
 
+    {
+        use gcloud_sdk::google::cloud::bigquery::storage::v1::BatchCommitWriteStreamsRequest;
+
+        let mut db_conn = db_conn.lock().await;
+        let mut tx = db_conn.begin().await?;
+
+        for write_stream in sqlx::query!(
+            r#"--sql
+            DELETE FROM committing RETURNING write_stream
+            "#
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|v| v.write_stream)
+        {
+            bigquery_write_client
+                .get()
+                .batch_commit_write_streams(BatchCommitWriteStreamsRequest {
+                    parent: format!(
+                        "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
+                        project = args.bigquery_project,
+                        dataset = args.bigquery_dataset,
+                    ),
+                    write_streams: vec![write_stream.clone()],
+                    ..Default::default()
+                })
+                .await?;
+        }
+
+        tx.commit().await?;
+    }
+
     // Write all pending stuff to queue.
     for did in {
         let mut db_conn = db_conn.lock().await;
@@ -354,7 +456,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     "{}/xrpc/com.atproto.sync.listRepos?limit=1000",
                     args.relay_host
                 );
-                url.push_str(&format!("&cursor={}", c));
+                url.push_str(&format!("&cursor={}", cursor));
 
                 #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
                 #[serde(rename_all = "camelCase")]

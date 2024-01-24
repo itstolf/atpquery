@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                    INSERT INTO errors (did, why)\n                    VALUES ($1, $2)\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5a5607f8670a2be840ccdb5a8fee985dd99f915e7ea0bd0bef2d4b62234c5e21"
+}

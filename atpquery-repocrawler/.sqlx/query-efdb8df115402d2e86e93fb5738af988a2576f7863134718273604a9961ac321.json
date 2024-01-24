@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                            DELETE FROM committing WHERE write_stream = ?\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "efdb8df115402d2e86e93fb5738af988a2576f7863134718273604a9961ac321"
+}

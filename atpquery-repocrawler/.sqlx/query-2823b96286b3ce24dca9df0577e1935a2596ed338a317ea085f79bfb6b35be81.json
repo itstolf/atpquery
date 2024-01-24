@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                            DELETE FROM pending WHERE did = ?\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "2823b96286b3ce24dca9df0577e1935a2596ed338a317ea085f79bfb6b35be81"
+}
