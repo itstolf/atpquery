@@ -2,7 +2,7 @@ use clap::Parser;
 use futures::TryStreamExt;
 use prost::Message;
 use prost_reflect::ReflectMessage;
-use sqlx::{Connection, Executor};
+use sqlx::{ConnectOptions, Connection, Executor};
 use tracing::Instrument;
 
 #[derive(Parser, Debug)]
@@ -14,7 +14,7 @@ struct Args {
     #[arg(long, default_value = "atpquery")]
     bigquery_dataset: String,
 
-    #[arg(long, default_value = "atpquery.db")]
+    #[arg(long, default_value = "atpquery-repocrawler.db")]
     db_path: String,
 
     #[arg(long, default_value = "https://bsky.network")]
@@ -74,7 +74,11 @@ async fn worker_main(
     db_conn: std::sync::Arc<tokio::sync::Mutex<sqlx::sqlite::SqliteConnection>>,
 ) -> Result<(), anyhow::Error> {
     loop {
-        let did = rx.recv().await?;
+        let did = if let Ok(did) = rx.recv().await {
+            did
+        } else {
+            return Ok(());
+        };
 
         for attempt in 0..5 {
             if let Err(err) = {
@@ -135,7 +139,8 @@ async fn worker_main(
                     )
                     .await??;
 
-                    let (bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
+                    const BATCH_SIZE: usize = 100;
+                    let (bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(BATCH_SIZE);
 
                     {
                         let mut bqw_stream = bigquery_write_client
@@ -193,7 +198,6 @@ async fn worker_main(
 
                             n += 1;
 
-                            const BATCH_SIZE: usize = 100;
                             if n % BATCH_SIZE == 0 {
                                 while n > 0 {
                                     bqw_stream.message().await?;
@@ -314,32 +318,35 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
     let db_conn = std::sync::Arc::new(tokio::sync::Mutex::new(
-        sqlx::sqlite::SqliteConnection::connect(&args.db_path).await?,
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .create_if_missing(true)
+            .filename(&args.db_path)
+            .connect()
+            .await?,
     ));
     {
         let mut db_conn = db_conn.lock().await;
         db_conn
             .execute(
                 r#"--sql
-            PRAGMA journal_mode = wal;
+                CREATE TABLE IF NOT EXISTS pending (
+                    did TEXT NOT NULL PRIMARY KEY
+                );
 
-            CREATE TABLE IF NOT EXISTS pending (
-                did TEXT NOT NULL PRIMARY KEY
-            );
+                CREATE TABLE IF NOT EXISTS cursor (
+                    cursor TEXT NOT NULL PRIMARY KEY
+                );
 
-            CREATE TABLE IF NOT EXISTS cursor (
-                cursor TEXT NOT NULL PRIMARY KEY
-            );
+                CREATE TABLE IF NOT EXISTS committing (
+                    write_stream TEXT NOT NULL PRIMARY KEY
+                );
 
-            CREATE TABLE IF NOT EXISTS committing (
-                write_stream TEXT NOT NULL PRIMARY KEY
-            );
-
-            CREATE TABLE IF NOT EXISTS errors (
-                did TEXT NOT NULL,
-                why TEXT NOT NULL
-            );
-            "#,
+                CREATE TABLE IF NOT EXISTS errors (
+                    did TEXT NOT NULL,
+                    why TEXT NOT NULL
+                );
+                "#,
             )
             .await?;
     }
@@ -528,6 +535,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     }
+    pending_tx.close();
 
     futures::future::join_all(workers)
         .await
