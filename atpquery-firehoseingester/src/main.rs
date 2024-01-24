@@ -275,6 +275,8 @@ async fn process_message(
                 }
             };
 
+            let rev = commit.rev.to_u64() as i64;
+
             let mut rows = vec![];
             let offset = *bq_seq;
 
@@ -288,25 +290,25 @@ async fn process_message(
 
                 match op.action.as_str() {
                     "create" | "update" => {
-                        let item = if let Some(item) = op.cid.and_then(|cid| items.get(&cid.into()))
-                        {
-                            item
-                        } else {
-                            continue;
-                        };
+                        let block =
+                            if let Some(block) = op.cid.and_then(|cid| items.get(&cid.into())) {
+                                block
+                            } else {
+                                continue;
+                            };
 
                         let record =
                             serde_json::to_string(&rewrite_tags(ciborium::from_reader::<
                                 ciborium::Value,
                                 _,
                             >(
-                                &mut std::io::Cursor::new(item),
+                                &mut std::io::Cursor::new(block),
                             )?)?)?;
                         rows.push(atpquery_protos::Row {
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),
-                            ingest_seq: Some(offset),
+                            rev: Some(rev),
                             record: Some(record.clone()),
                         });
                         tracing::info!(
@@ -315,6 +317,7 @@ async fn process_message(
                             actor_did = commit.repo,
                             collection = collection,
                             rkey = rkey,
+                            rev = ?commit.rev,
                             record = record
                         );
                     }
@@ -323,7 +326,7 @@ async fn process_message(
                             collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
                             rkey: Some(rkey.to_string()),
-                            ingest_seq: Some(offset),
+                            rev: Some(rev),
                             record: None,
                         });
                         tracing::info!(
@@ -331,6 +334,7 @@ async fn process_message(
                             seq = commit.seq,
                             actor_did = commit.repo,
                             collection = collection,
+                            rev = ?commit.rev,
                             rkey = rkey
                         );
                     }

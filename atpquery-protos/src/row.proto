@@ -6,6 +6,6 @@ message Row {
   optional string repo = 1;
   optional string collection = 2;
   optional string rkey = 3;
-  optional int64 ingest_seq = 4;
+  optional int64 rev = 4;
   optional string record = 5;
 }

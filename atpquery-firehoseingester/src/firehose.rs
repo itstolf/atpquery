@@ -1,63 +1,15 @@
-use std::io::Read;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DagCborCidGeneric<const S: usize>(cid::CidGeneric<S>);
-
-pub type DagCborCid = DagCborCidGeneric<64>;
-
-impl<'de, const S: usize> serde::Deserialize<'de> for DagCborCidGeneric<S> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut r = std::io::Cursor::new(
-            ciborium::tag::Required::<Vec<u8>, 42>::deserialize(deserializer)?.0,
-        );
-        let mut prefix = [0u8; 1];
-        r.read_exact(&mut prefix[..])
-            .map_err(serde::de::Error::custom)?;
-        let [prefix] = prefix;
-        if prefix != 0x00 {
-            return Err(serde::de::Error::invalid_value(
-                serde::de::Unexpected::Unsigned(prefix as u64),
-                &"expected multibase identity (0x00) prefix",
-            ));
-        }
-        Ok(DagCborCidGeneric(
-            cid::CidGeneric::<S>::read_bytes(r).map_err(serde::de::Error::custom)?,
-        ))
-    }
-}
-
-impl<const S: usize> From<cid::CidGeneric<S>> for DagCborCidGeneric<S> {
-    fn from(value: cid::CidGeneric<S>) -> Self {
-        Self(value)
-    }
-}
-
-impl<const S: usize> From<DagCborCidGeneric<S>> for cid::CidGeneric<S> {
-    fn from(value: DagCborCidGeneric<S>) -> Self {
-        value.0
-    }
-}
-
-impl<'a, const S: usize> From<&'a DagCborCidGeneric<S>> for &'a cid::CidGeneric<S> {
-    fn from(value: &'a DagCborCidGeneric<S>) -> Self {
-        &value.0
-    }
-}
-
 #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Commit {
-    pub blobs: Vec<DagCborCid>,
+    pub blobs: Vec<atproto_repo::dagcbor::DagCborCid>,
     #[serde(with = "serde_bytes", default)]
     pub blocks: Vec<u8>,
-    pub commit: Option<DagCborCid>,
+    pub commit: Option<atproto_repo::dagcbor::DagCborCid>,
     pub ops: Vec<RepoOp>,
-    pub prev: Option<DagCborCid>,
+    pub prev: Option<atproto_repo::dagcbor::DagCborCid>,
     pub rebase: bool,
     pub repo: String,
+    pub rev: atproto_repo::tid::Tid,
     pub seq: i64,
     #[serde(deserialize_with = "time::serde::rfc3339::deserialize")]
     pub time: time::OffsetDateTime,
@@ -95,7 +47,7 @@ pub struct Migrate {
 #[serde(rename_all = "camelCase")]
 pub struct RepoOp {
     pub action: String,
-    pub cid: Option<DagCborCid>,
+    pub cid: Option<atproto_repo::dagcbor::DagCborCid>,
     pub path: String,
 }
 
