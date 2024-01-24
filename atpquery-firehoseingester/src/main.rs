@@ -147,19 +147,25 @@ async fn main() -> Result<(), anyhow::Error> {
     let (mut bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
     let seqs = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
-    let mut task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::task::spawn({
-        let write_stream = write_stream.clone();
-        let seqs = std::sync::Arc::clone(&seqs);
+    let mut bqw_stream = bigquery_write_client
+        .get()
+        .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
+        .await?
+        .into_inner();
 
-        async move {
-            use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_response::Response;
-            let mut stream = bigquery_write_client
-                .get()
-                .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
-                .await?
-                .into_inner();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tx.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
+                ).await??;
+            }
 
-            while let Some(v) = stream.message().await? {
+            v = bqw_stream.message() => {
+                let v = if let Some(v) = v? { v } else { break; };
+
+                use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_response::Response;
                 let r = match v.response.unwrap() {
                     Response::AppendResult(r) => r,
                     Response::Error(status) => {
@@ -182,22 +188,6 @@ async fn main() -> Result<(), anyhow::Error> {
                     firehose_seq,
                     write_stream: write_stream.clone(),
                 })?;
-            }
-            Ok(())
-        }
-    });
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    tx.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
-                ).await??;
-            }
-
-            r = &mut task => {
-                return r?.map_err(|e| e.into());
             }
 
             msg = tokio::time::timeout(std::time::Duration::from_secs(60), rx.next()) => {
@@ -254,7 +244,7 @@ fn rewrite_tags(v: ciborium::Value) -> Result<ciborium::Value, cid::Error> {
 async fn process_message(
     message: &[u8],
     write_stream: &str,
-    req_tx: &mut tokio::sync::mpsc::Sender<
+    bqw_tx: &mut tokio::sync::mpsc::Sender<
         gcloud_sdk::google::cloud::bigquery::storage::v1::AppendRowsRequest,
     >,
     bq_seq: &mut i64,
@@ -306,8 +296,8 @@ async fn process_message(
                                 &mut std::io::Cursor::new(block),
                             )?)?)?;
                         rows.push(atpquery_protos::Row {
-                            collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
+                            collection: Some(collection.to_string()),
                             rkey: Some(rkey.to_string()),
                             rev: Some(rev),
                             record: Some(record.clone()),
@@ -315,7 +305,7 @@ async fn process_message(
                         tracing::info!(
                             action = op.action,
                             seq = commit.seq,
-                            actor_did = commit.repo,
+                            repo = commit.repo,
                             collection = collection,
                             rkey = rkey,
                             rev = ?commit.rev,
@@ -324,8 +314,8 @@ async fn process_message(
                     }
                     "delete" => {
                         rows.push(atpquery_protos::Row {
-                            collection: Some(collection.to_string()),
                             repo: Some(commit.repo.clone()),
+                            collection: Some(collection.to_string()),
                             rkey: Some(rkey.to_string()),
                             rev: Some(rev),
                             record: None,
@@ -333,7 +323,7 @@ async fn process_message(
                         tracing::info!(
                             action = op.action,
                             seq = commit.seq,
-                            actor_did = commit.repo,
+                            repo = commit.repo,
                             collection = collection,
                             rev = ?commit.rev,
                             rkey = rkey
@@ -360,7 +350,7 @@ async fn process_message(
                         AppendRowsRequest, ProtoRows, ProtoSchema,
                     };
 
-                    req_tx
+                    bqw_tx
                         .send(AppendRowsRequest {
                             write_stream: write_stream.to_string(),
                             offset: Some(offset),
@@ -403,14 +393,14 @@ async fn process_message(
                 };
 
                 let row = atpquery_protos::Row {
-                    collection: Some(tombstone.did),
-                    repo: None,
+                    repo: Some(tombstone.did),
+                    collection: None,
                     rkey: None,
                     rev: None,
                     record: None,
                 };
 
-                req_tx
+                bqw_tx
                     .send(AppendRowsRequest {
                         write_stream: write_stream.to_string(),
                         offset: Some(offset),

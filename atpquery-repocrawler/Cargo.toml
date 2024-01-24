@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+async-channel = "2"
 atproto-repo = { path = "../atproto-repo" }
 atpquery-protos = { path = "../atpquery-protos" }
 ciborium = "0.2"

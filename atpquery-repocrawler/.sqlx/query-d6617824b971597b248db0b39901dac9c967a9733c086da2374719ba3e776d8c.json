@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT cursor FROM cursor",
+  "describe": {
+    "columns": [
+      {
+        "name": "cursor",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d6617824b971597b248db0b39901dac9c967a9733c086da2374719ba3e776d8c"
+}

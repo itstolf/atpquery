@@ -1,6 +1,8 @@
 use clap::Parser;
 use futures::TryStreamExt;
-use sqlx::Connection;
+use prost::Message;
+use prost_reflect::ReflectMessage;
+use sqlx::{Connection, Executor};
 use tracing::Instrument;
 
 #[derive(Parser, Debug)]
@@ -60,169 +62,179 @@ async fn worker_main(
     client: reqwest::Client,
     bigquery_write_client: gcloud_sdk::GoogleApi<gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient<gcloud_sdk::GoogleAuthMiddleware>>,
     rl: std::sync::Arc<governor::DefaultDirectRateLimiter>,
-    queued_notify: std::sync::Arc<tokio::sync::Notify>,
-    db_pool: sqlx::sqlite::SqlitePool,
+    rx: async_channel::Receiver<String>,
+    db_conn: std::sync::Arc<tokio::sync::Mutex<sqlx::sqlite::SqliteConnection>>,
 ) -> Result<(), anyhow::Error> {
     loop {
-        loop {
-            const TABLE_NAME: &str = "raw_records";
-            let write_stream = bigquery_write_client.get().create_write_stream(
-                gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
-                    parent: format!(
-                        "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
-                        project = bigquery_project,
-                        dataset = bigquery_dataset,
-                    ),
-                    write_stream: Some(
-                        gcloud_sdk::google::cloud::bigquery::storage::v1::WriteStream {
-                            r#type: gcloud_sdk::google::cloud::bigquery::storage::v1::write_stream::Type::Pending as i32,
-                            ..Default::default()
-                        },
-                    ),
-                },
-            ).await?.get_ref().name.clone();
-            let mut tx = db_pool.begin().await?;
-            // let did = if let Some(did) = sqlx::query!(
-            //     r#"--sql
-            //     DELETE FROM pending
-            //     WHERE
-            //         did = (
-            //             SELECT did
-            //             FROM pending
-            //             FOR UPDATE
-            //             SKIP LOCKED
-            //             LIMIT 1
-            //         )
-            //     RETURNING did
-            //     "#
-            // )
-            // .fetch_optional(&mut *tx)
-            // .await?
-            // .map(|r| r.did)
-            // {
-            //     did
-            // } else {
-            //     queued_notify.notified().await;
-            //     tracing::info!("wakeup");
-            //     continue;
-            // };
-            let did = "a";
+        let did = rx.recv().await?;
 
-            for attempt in 0..5 {
-                if let Err(err) = {
-                    let mut blockstore_loader = atproto_repo::blockstore::Loader::new();
-                    blockstore_loader.mst_ignore_missing(true);
-
-                    let rl = &rl;
-                    let relay_host = &relay_host;
-                    let client = &client;
-                    let did = did.clone();
-
-                    let tx = &mut tx;
-                    (move || async move {
-                        rl.until_ready().await;
-                        let repo = tokio::time::timeout(
-                            std::time::Duration::from_secs(30 * 60),
-                            blockstore_loader.load(
-                                &mut tokio::time::timeout(
-                                    std::time::Duration::from_secs(10 * 60),
-                                    client
-                                        .get(format!(
-                                            "{}/xrpc/com.atproto.sync.getRepo?did={}",
-                                            relay_host, did
-                                        ))
-                                        .send(),
-                                )
-                                .await??
-                                .error_for_status()?
-                                .bytes_stream()
-                                .map_err(|e| futures::io::Error::new(futures::io::ErrorKind::Other, e))
-                                .into_async_read(),
-                            ),
-                        )
-                        .await??;
-
-                        for (key, cid) in repo.key_and_cids() {
-                            let key = String::from_utf8_lossy(key);
-                            let (collection, rkey) = match key.splitn(2, '/').collect::<Vec<_>>()[..] {
-                                [collection, rkey] => (collection, rkey),
-                                _ => {
-                                    continue;
-                                }
-                            };
-
-                            let block = if let Some(block) = repo.get_by_cid(cid) {
-                                block
-                            } else {
-                                continue;
-                            };
-
-                            let record =
-                            serde_json::to_string(&rewrite_tags(ciborium::from_reader::<
-                                ciborium::Value,
-                                _,
-                            >(
-                                &mut std::io::Cursor::new(block),
-                            )?)?)?;
-
-                            // TODO: Write records.
-                        }
-
-                        Ok::<_, anyhow::Error>(())
-                    })()
-                    .await
-                } {
-                    let why = format!("{:?}", err);
-                    tracing::error!(did, why, attempt);
-                    match err.downcast_ref::<atproto_repo::blockstore::Error>() {
-                        Some(atproto_repo::blockstore::Error::MissingRootCid(_)) => {
-                            // Try again.
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    // sqlx::query!(
-                    //     r#"--sql
-                    //     INSERT INTO followscrawler.errors (did, why)
-                    //     VALUES ($1, $2)
-                    //     "#,
-                    //     did,
-                    //     why
-                    // )
-                    // .execute(&mut *tx)
-                    // .await?;
-                }
-                break;
-            }
-            bigquery_write_client
-                .get()
-                .finalize_write_stream(
-                    gcloud_sdk::google::cloud::bigquery::storage::v1::FinalizeWriteStreamRequest {
-                        name: write_stream.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            // TODO: Save write stream name.
-            tx.commit().await?;
-
-            let mut tx = db_pool.begin().await?;
-            bigquery_write_client
-                .get()
-                .batch_commit_write_streams(
-                    gcloud_sdk::google::cloud::bigquery::storage::v1::BatchCommitWriteStreamsRequest {
+        for attempt in 0..5 {
+            if let Err(err) = {
+                const TABLE_NAME: &str = "raw_records";
+                let write_stream = bigquery_write_client.get().create_write_stream(
+                    gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
                         parent: format!(
                             "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
                             project = bigquery_project,
                             dataset = bigquery_dataset,
                         ),
-                        write_streams: vec![write_stream],
-                        ..Default::default()
+                        write_stream: Some(
+                            gcloud_sdk::google::cloud::bigquery::storage::v1::WriteStream {
+                                r#type: gcloud_sdk::google::cloud::bigquery::storage::v1::write_stream::Type::Pending as i32,
+                                ..Default::default()
+                            },
+                        ),
                     },
-                )
-                .await?;
-            // TODO: Flush write stream.
-            tx.commit().await?;
+                ).await?.get_ref().name.clone();
+
+                let mut blockstore_loader = atproto_repo::blockstore::Loader::new();
+                blockstore_loader.mst_ignore_missing(true);
+
+                let rl = &rl;
+                let relay_host = &relay_host;
+                let client = &client;
+                let did = did.as_str();
+                let write_stream = &write_stream;
+                let bigquery_project = bigquery_project.as_str();
+                let bigquery_dataset = bigquery_dataset.as_str();
+                let bigquery_write_client = bigquery_write_client.clone();
+
+                (move || async move {
+                    rl.until_ready().await;
+                    let repo = tokio::time::timeout(
+                        std::time::Duration::from_secs(30 * 60),
+                        blockstore_loader.load(
+                            &mut tokio::time::timeout(
+                                std::time::Duration::from_secs(10 * 60),
+                                client
+                                    .get(format!(
+                                        "{}/xrpc/com.atproto.sync.getRepo?did={}",
+                                        relay_host, did
+                                    ))
+                                    .send(),
+                            )
+                            .await??
+                            .error_for_status()?
+                            .bytes_stream()
+                            .map_err(|e| futures::io::Error::new(futures::io::ErrorKind::Other, e))
+                            .into_async_read(),
+                        ),
+                    )
+                    .await??;
+
+                    let (bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
+
+                    let mut bqw_stream = bigquery_write_client
+                        .get()
+                        .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
+                        .await?
+                        .into_inner();
+
+                    for (key, cid) in repo.key_and_cids() {
+                        let key = String::from_utf8_lossy(key);
+                        let (collection, rkey) = match key.splitn(2, '/').collect::<Vec<_>>()[..] {
+                            [collection, rkey] => (collection, rkey),
+                            _ => {
+                                continue;
+                            }
+                        };
+
+                        let block = if let Some(block) = repo.get_by_cid(cid) {
+                            block
+                        } else {
+                            continue;
+                        };
+
+                        use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
+                            ProtoData, Rows,
+                        };
+                        use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+                            AppendRowsRequest, ProtoRows, ProtoSchema,
+                        };
+
+                        let row = atpquery_protos::Row {
+                            repo: Some(did.to_string()),
+                            collection: Some(collection.to_string()),
+                            rkey: Some(rkey.to_string()),
+                            rev: Some(repo.commit().rev.0 as i64),
+                            record: Some(serde_json::to_string(&rewrite_tags(
+                                ciborium::from_reader::<ciborium::Value, _>(
+                                    &mut std::io::Cursor::new(block),
+                                )?,
+                            )?)?),
+                        };
+
+                        bqw_tx
+                            .send(AppendRowsRequest {
+                                write_stream: write_stream.to_string(),
+                                rows: Some(Rows::ProtoRows(ProtoData {
+                                    writer_schema: Some(ProtoSchema {
+                                        proto_descriptor: Some(
+                                            row.descriptor().descriptor_proto().clone(),
+                                        ),
+                                    }),
+                                    rows: Some(ProtoRows {
+                                        serialized_rows: vec![row.encode_to_vec()],
+                                    }),
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            })
+                            .await?;
+                    }
+
+                    // TODO: Check stream completion.
+                    bigquery_write_client
+                    .get()
+                    .finalize_write_stream(
+                        gcloud_sdk::google::cloud::bigquery::storage::v1::FinalizeWriteStreamRequest {
+                            name: write_stream.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+
+                    // TODO: Save write stream name.
+                    bigquery_write_client
+                        .get()
+                        .batch_commit_write_streams(
+                            gcloud_sdk::google::cloud::bigquery::storage::v1::BatchCommitWriteStreamsRequest {
+                                parent: format!(
+                                    "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
+                                    project = bigquery_project,
+                                    dataset = bigquery_dataset,
+                                ),
+                                write_streams: vec![write_stream.clone()],
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+
+                    Ok::<_, anyhow::Error>(())
+                })()
+                .await
+            } {
+                let why = format!("{:?}", err);
+                tracing::error!(did, why, attempt);
+                match err.downcast_ref::<atproto_repo::blockstore::Error>() {
+                    Some(atproto_repo::blockstore::Error::MissingRootCid(_)) => {
+                        // Try again.
+                        continue;
+                    }
+                    _ => {}
+                }
+                // sqlx::query!(
+                //     r#"--sql
+                //     INSERT INTO errors (did, why)
+                //     VALUES ($1, $2)
+                //     "#,
+                //     did,
+                //     why
+                // )
+                // .execute(&mut *tx)
+                // .await?;
+            }
+            break;
         }
     }
 }
@@ -236,10 +248,31 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
 
-    let db_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect(&args.db_path)
-        .await?;
+    let db_conn = std::sync::Arc::new(tokio::sync::Mutex::new(
+        sqlx::sqlite::SqliteConnection::connect(&args.db_path).await?,
+    ));
+    {
+        let mut db_conn = db_conn.lock().await;
+        db_conn
+            .execute(
+                r#"--sql
+            PRAGMA journal_mode = wal;
+
+            CREATE TABLE IF NOT EXISTS pending (
+                did TEXT NOT NULL PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS cursor (
+                cursor TEXT NOT NULL PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS finalizing (
+                did TEXT NOT NULL PRIMARY KEY
+            );
+            "#,
+            )
+            .await?;
+    }
 
     let bigquery_write_client = gcloud_sdk::GoogleApi::from_function(
             gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_write_client::BigQueryWriteClient::new,
@@ -252,20 +285,20 @@ async fn main() -> Result<(), anyhow::Error> {
         std::num::NonZeroU32::new(3000 / (5 * 60)).unwrap(),
     )));
 
-    let queued_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-
     let client = reqwest::Client::new();
+
+    let (pending_tx, pending_rx) = async_channel::bounded(args.num_workers * 20);
 
     let workers = (0..args.num_workers)
         .map(|i| {
             tokio::spawn({
-                let db_pool = db_pool.clone();
+                let db_conn = std::sync::Arc::clone(&db_conn);
                 let relay_host = args.relay_host.clone();
                 let bigquery_project = args.bigquery_project.clone();
                 let bigquery_dataset = args.bigquery_dataset.clone();
                 let client = client.clone();
                 let rl = std::sync::Arc::clone(&rl);
-                let queued_notify = std::sync::Arc::clone(&queued_notify);
+                let pending_rx = pending_rx.clone();
                 let bigquery_write_client = bigquery_write_client.clone();
                 async move {
                     worker_main(
@@ -275,8 +308,8 @@ async fn main() -> Result<(), anyhow::Error> {
                         client,
                         bigquery_write_client,
                         rl,
-                        queued_notify,
-                        db_pool,
+                        pending_rx,
+                        db_conn,
                     )
                     .instrument(tracing::info_span!("worker", i))
                     .await
@@ -284,6 +317,114 @@ async fn main() -> Result<(), anyhow::Error> {
             })
         })
         .collect::<Vec<_>>();
+
+    // Write all pending stuff to queue.
+    for did in {
+        let mut db_conn = db_conn.lock().await;
+        sqlx::query!(
+            r#"--sql
+            SELECT did FROM pending
+            "#
+        )
+        .fetch_all(&mut *db_conn)
+        .await?
+        .into_iter()
+        .map(|r| r.did)
+        .collect::<Vec<_>>()
+    } {
+        pending_tx.send(did).await?;
+    }
+
+    'top: {
+        if !args.only_crawl_queued_repos {
+            let cursor = if let Some(cursor) = {
+                let mut db_conn = db_conn.lock().await;
+                sqlx::query!("SELECT cursor FROM cursor")
+                    .fetch_optional(&mut *db_conn)
+                    .await?
+                    .map(|v| v.cursor)
+            } {
+                cursor
+            } else {
+                break 'top;
+            };
+
+            loop {
+                let mut url = format!(
+                    "{}/xrpc/com.atproto.sync.listRepos?limit=1000",
+                    args.relay_host
+                );
+                url.push_str(&format!("&cursor={}", c));
+
+                #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+                #[serde(rename_all = "camelCase")]
+                struct Output {
+                    cursor: Option<String>,
+                    repos: Vec<Repo>,
+                }
+
+                #[derive(serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+                #[serde(rename_all = "camelCase")]
+                struct Repo {
+                    did: String,
+                    head: String,
+                }
+
+                rl.until_ready().await;
+                let output: Output = serde_json::from_slice(
+                    &client
+                        .get(url)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .bytes()
+                        .await?,
+                )?;
+
+                let mut db_conn = db_conn.lock().await;
+                let mut tx = db_conn.begin().await?;
+                for repo in output.repos {
+                    sqlx::query!(
+                        r#"--sql
+                        INSERT OR IGNORE INTO pending (did)
+                        VALUES (?)
+                        "#,
+                        repo.did
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    pending_tx.send(repo.did).await?;
+                }
+
+                if let Some(c) = output.cursor.as_ref() {
+                    sqlx::query!(
+                        r#"--sql
+                        UPDATE cursor
+                        SET cursor = ?
+                        "#,
+                        c
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                } else {
+                    sqlx::query!(
+                        r#"--sql
+                        DELETE FROM cursor
+                        "#
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                tx.commit().await?;
+
+                if output.cursor.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
     futures::future::join_all(workers)
         .await
         .into_iter()

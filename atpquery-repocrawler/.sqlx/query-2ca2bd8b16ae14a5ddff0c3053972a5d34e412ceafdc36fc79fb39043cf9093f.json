@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n            SELECT did FROM pending\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "did",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2ca2bd8b16ae14a5ddff0c3053972a5d34e412ceafdc36fc79fb39043cf9093f"
+}
