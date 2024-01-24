@@ -10,6 +10,10 @@ pub enum Error {
 pub struct Tid(pub u64);
 
 impl Tid {
+    pub fn is_strictly_valid(&self) -> bool {
+        (self.0 >> 63) == 0
+    }
+
     pub fn extract_time(&self) -> Result<time::OffsetDateTime, time::error::ComponentRange> {
         time::OffsetDateTime::from_unix_timestamp_nanos((self.0 >> 10) as i128 * 1000)
     }
