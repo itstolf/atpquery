@@ -218,6 +218,7 @@ async fn worker_main(
                             ..Default::default()
                         })
                         .await?;
+                    tracing::info!(action = "finalize", did = did);
 
                     {
                         let mut db_conn = db_conn.lock().await;
@@ -270,7 +271,7 @@ async fn worker_main(
                         .await?;
                     }
 
-                    tracing::info!(action = "repo", did = did);
+                    tracing::info!(action = "commit", write_stream = write_stream);
                     Ok::<_, anyhow::Error>(())
                 })()
                 .await
@@ -415,6 +416,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     ..Default::default()
                 })
                 .await?;
+            tracing::info!(action = "commit", write_stream = write_stream);
         }
 
         tx.commit().await?;
