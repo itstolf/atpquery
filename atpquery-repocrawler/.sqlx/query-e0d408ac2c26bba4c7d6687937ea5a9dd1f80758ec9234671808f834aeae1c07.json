@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                                DELETE FROM cursor\n                                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "e0d408ac2c26bba4c7d6687937ea5a9dd1f80758ec9234671808f834aeae1c07"
+}

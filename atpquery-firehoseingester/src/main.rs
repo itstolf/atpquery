@@ -70,7 +70,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .install()?;
 
     metrics::describe_histogram!(
-        "atpbq-firehoseingester.ingest_delay",
+        "atpbq_firehoseingester.ingest_delay",
         metrics::Unit::Seconds,
         "ingestion delay"
     );
@@ -124,7 +124,7 @@ async fn main() -> Result<(), anyhow::Error> {
         write_stream_and_bq_seq
     } else {
         const TABLE_NAME: &str = "raw_records";
-        (bigquery_write_client.get().create_write_stream(
+        let write_stream = bigquery_write_client.get().create_write_stream(
             gcloud_sdk::google::cloud::bigquery::storage::v1::CreateWriteStreamRequest {
                 parent: format!(
                     "projects/{project}/datasets/{dataset}/tables/{TABLE_NAME}",
@@ -138,7 +138,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     },
                 ),
             },
-        ).await?.get_ref().name.clone(), 0)
+        ).await?.get_ref().name.clone();
+        tracing::info!(write_stream = write_stream);
+        (write_stream, 0)
     };
 
     let (stream, _) = tokio_tungstenite::connect_async(url).await?;
@@ -147,24 +149,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let (mut bqw_tx, bqw_rx) = tokio::sync::mpsc::channel(1);
     let seqs = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
 
-    let mut bqw_stream = bigquery_write_client
-        .get()
-        .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
-        .await?
-        .into_inner();
+    let mut task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::task::spawn({
+        let write_stream = write_stream.clone();
+        let seqs = std::sync::Arc::clone(&seqs);
 
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    tx.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
-                ).await??;
-            }
+        async move {
+            let mut stream = bigquery_write_client
+                .get()
+                .append_rows(tokio_stream::wrappers::ReceiverStream::new(bqw_rx))
+                .await?
+                .into_inner();
 
-            v = bqw_stream.message() => {
-                let v = if let Some(v) = v? { v } else { break; };
-
+            while let Some(v) = stream.message().await? {
                 use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_response::Response;
                 let r = match v.response.unwrap() {
                     Response::AppendResult(r) => r,
@@ -188,6 +184,23 @@ async fn main() -> Result<(), anyhow::Error> {
                     firehose_seq,
                     write_stream: write_stream.clone(),
                 })?;
+            }
+
+            Ok(())
+        }
+    });
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tx.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
+                ).await??;
+            }
+
+            r = &mut task => {
+                return r?.map_err(|e| e.into());
             }
 
             msg = tokio::time::timeout(std::time::Duration::from_secs(60), rx.next()) => {
@@ -385,11 +398,8 @@ async fn process_message(
             }
 
             {
-                use gcloud_sdk::google::cloud::bigquery::storage::v1::append_rows_request::{
-                    ProtoData, Rows,
-                };
                 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-                    AppendRowsRequest, ProtoRows, ProtoSchema,
+                    append_rows_request, AppendRowsRequest, ProtoRows, ProtoSchema,
                 };
 
                 let row = atpquery_protos::Row {
@@ -404,15 +414,19 @@ async fn process_message(
                     .send(AppendRowsRequest {
                         write_stream: write_stream.to_string(),
                         offset: Some(offset),
-                        rows: Some(Rows::ProtoRows(ProtoData {
-                            writer_schema: Some(ProtoSchema {
-                                proto_descriptor: Some(row.descriptor().descriptor_proto().clone()),
-                            }),
-                            rows: Some(ProtoRows {
-                                serialized_rows: vec![row.encode_to_vec()],
-                            }),
-                            ..Default::default()
-                        })),
+                        rows: Some(append_rows_request::Rows::ProtoRows(
+                            append_rows_request::ProtoData {
+                                writer_schema: Some(ProtoSchema {
+                                    proto_descriptor: Some(
+                                        row.descriptor().descriptor_proto().clone(),
+                                    ),
+                                }),
+                                rows: Some(ProtoRows {
+                                    serialized_rows: vec![row.encode_to_vec()],
+                                }),
+                                ..Default::default()
+                            },
+                        )),
                         ..Default::default()
                     })
                     .await?;
@@ -426,7 +440,7 @@ async fn process_message(
 
     let now = time::OffsetDateTime::now_utc();
     metrics::histogram!(
-        "atpbq-firehoseingester.ingest_delay",
+        "atpbq_firehoseingester.ingest_delay",
         (now - time).as_seconds_f64()
     );
 

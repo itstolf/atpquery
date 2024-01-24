@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                                UPDATE cursor\n                                SET cursor = ?\n                                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "fcf7cc8bc751eadc3bf8b1ad851323a936d38960a72fa73dc452e5afe8d84197"
+}

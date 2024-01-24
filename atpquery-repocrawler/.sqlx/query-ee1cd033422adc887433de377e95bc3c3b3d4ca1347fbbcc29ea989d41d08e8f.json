@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "--sql\n                            INSERT OR IGNORE INTO pending (did)\n                            VALUES (?)\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "ee1cd033422adc887433de377e95bc3c3b3d4ca1347fbbcc29ea989d41d08e8f"
+}

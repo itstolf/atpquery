@@ -1,3 +1,8 @@
+DROP TABLE IF EXISTS atpquery.raw_records;
+DROP MATERIALIZED VIEW IF EXISTS atpquery.agg_records;
+DROP MATERIALIZED VIEW IF EXISTS atpquery.tombstones;
+DROP VIEW IF EXISTS atpquery.records;
+
 CREATE TABLE atpquery.raw_records (
     repo STRING NOT NULL,
     collection STRING,

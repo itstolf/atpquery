@@ -276,6 +276,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
